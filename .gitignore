@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Large Model Files and ONNX/TensorRT Binaries
+*.pt
+*.onnx
+*.engine
+*.plan
+
+# Alternatively, if you want to ignore the whole model_repository contents but keep the configs:
+# model_repository/**/*.onnx
+# model_repository/**/*.plan
+# model_repository/**/*.engine
+
+# Inference Images and Results
+*_result.jpg
+*_result.png
+frame_*.jpg
+
+# Just in case you want to ignore all raw test images (uncomment if needed)
+# *.jpg
+# *.png
+# *.jpeg
+
+# System Files
+.DS_Store
+Thumbs.db

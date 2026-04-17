@@ -1,0 +1,38 @@
+name: "yolo11x"
+platform: "onnxruntime_onnx"
+max_batch_size: 8
+input [
+  {
+    name: "images"
+    data_type: TYPE_FP32
+    dims: [3, 640, 640]
+  }
+]
+output [
+  {
+    name: "output0"
+    data_type: TYPE_FP32
+    dims: [1, 84, 8400]
+  }
+]
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+  }
+]
+optimization {
+  execution_accelerators {
+    gpu_execution_accelerator {
+      name: "tensorrt"
+      parameters {
+        key: "precision_mode"
+        value: "FP16"
+      }
+      parameters {
+        key: "max_workspace_size_bytes"
+        value: "10737418240"
+      }
+    }
+  }
+}
