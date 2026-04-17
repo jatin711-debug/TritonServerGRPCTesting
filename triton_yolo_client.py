@@ -148,7 +148,13 @@ def infer_image_triton(image_path: str, visualize: bool = True, output_path: str
     # Prepare request
     # Build inference request
     try:
-        triton_client = grpcclient.InferenceServerClient(url=TRITON_URL)
+        triton_client = grpcclient.InferenceServerClient(
+            url=TRITON_URL,
+            channel_args=[
+                ('grpc.keepalive_time_ms', 10000),
+                ('grpc.keepalive_timeout_ms', 5000),
+            ]
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to create triton client: {e}")
 
@@ -215,7 +221,7 @@ def infer_image_concurrent(image_path: str, request_id: int, output_dir: str = "
     outputs = [grpcclient.InferRequestedOutput(OUTPUT_NAME)]
 
     start_time = time.perf_counter()
-    result = triton_client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+    result = triton_client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs, client_timeout=300)
     inference_time = time.perf_counter() - start_time
 
     output_data = result.as_numpy(OUTPUT_NAME)
@@ -253,8 +259,23 @@ def run_concurrent_inference(image_path: str, num_requests: int = 50, max_worker
     print("-" * 50)
 
     # Create ONE client and reuse it (thread-safe for grpc client)
-    triton_client = grpcclient.InferenceServerClient(url=TRITON_URL)
+    triton_client = grpcclient.InferenceServerClient(
+        url=TRITON_URL,
+        channel_args=[
+            ('grpc.keepalive_time_ms', 10000),
+            ('grpc.keepalive_timeout_ms', 5000),
+        ]
+    )
     print("Triton client connected successfully")
+
+    # Warmup: send one request first to trigger TensorRT engine compilation
+    print("Sending warmup request (TensorRT compilation may take a few minutes on first run)...")
+    try:
+        warmup_result = infer_image_concurrent(image_path, -1, "outputs", triton_client)
+        print(f"Warmup done in {warmup_result['inference_time_ms']:.2f}ms — server is hot!")
+    except Exception as e:
+        print(f"Warmup failed: {e}")
+        return [], []
 
     results = []
     errors = []
@@ -304,7 +325,13 @@ def infer_video_stream(video_path: int = 0):
     total_inference_time = 0
 
     try:
-        triton_client = grpcclient.InferenceServerClient(url=TRITON_URL)
+        triton_client = grpcclient.InferenceServerClient(
+            url=TRITON_URL,
+            channel_args=[
+                ('grpc.keepalive_time_ms', 10000),
+                ('grpc.keepalive_timeout_ms', 5000),
+            ]
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to create triton client: {e}")
 
