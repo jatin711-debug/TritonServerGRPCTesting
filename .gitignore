@@ -58,3 +58,5 @@ frame_*.jpg
 # System Files
 .DS_Store
 Thumbs.db
+
+outputs

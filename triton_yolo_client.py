@@ -14,10 +14,13 @@ import time
 from typing import List, Tuple, Optional
 import tracemalloc
 import tritonclient.grpc as grpcclient
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import os
 
 # Triton server settings
 TRITON_URL = "localhost:8001"
-MODEL_NAME = "yolo11x"
+MODEL_NAME = "yolo11s"
 INPUT_NAME = "images"
 OUTPUT_NAME = "output0"
 
@@ -132,7 +135,7 @@ def postprocess_detections(
 
     return results
 
-def infer_image_triton(image_path: str, visualize: bool = True) -> dict:
+def infer_image_triton(image_path: str, visualize: bool = True, output_path: str = None) -> dict:
     """Send image to Triton server for inference."""
     # Read and preprocess image
     image = cv2.imread(image_path)
@@ -179,7 +182,8 @@ def infer_image_triton(image_path: str, visualize: bool = True) -> dict:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         # Save to file instead of imshow (works in headless environments)
-        output_path = image_path.rsplit('.', 1)[0] + '_result.jpg'
+        if output_path is None:
+            output_path = image_path.rsplit('.', 1)[0] + '_result.jpg'
         cv2.imwrite(output_path, image)
         print(f"Result saved to: {output_path}")
 
@@ -188,6 +192,104 @@ def infer_image_triton(image_path: str, visualize: bool = True) -> dict:
         "inference_time_ms": inference_time * 1000,
         "peak_memory_mb": peak / (1024 * 1024)
     }
+
+
+def infer_image_concurrent(image_path: str, request_id: int, output_dir: str = "outputs", triton_client=None) -> dict:
+    """Single inference request for concurrent execution."""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"result_{request_id:04d}.jpg")
+
+    # Read and preprocess image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not read image: {image_path}")
+
+    orig_h, orig_w = image.shape[:2]
+    input_data, scale, pad, _ = preprocess_image(image)
+
+    if triton_client is None:
+        triton_client = grpcclient.InferenceServerClient(url=TRITON_URL)
+
+    inputs = [grpcclient.InferInput(INPUT_NAME, input_data.shape, "FP32")]
+    inputs[0].set_data_from_numpy(input_data)
+    outputs = [grpcclient.InferRequestedOutput(OUTPUT_NAME)]
+
+    start_time = time.perf_counter()
+    result = triton_client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+    inference_time = time.perf_counter() - start_time
+
+    output_data = result.as_numpy(OUTPUT_NAME)
+    if output_data is None:
+        raise RuntimeError(f"Request #{request_id}: Got None output from server")
+
+    detections = postprocess_detections(output_data, scale, pad, (orig_h, orig_w))
+
+    # Visualize
+    for class_id, conf, (x1, y1, x2, y2) in detections:
+        label = COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"class_{class_id}"
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(image, f"{label}: {conf:.2f}", (x1, y1 - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # Add request ID overlay
+    cv2.putText(image, f"Request #{request_id}", (10, orig_h - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+    cv2.imwrite(output_path, image)
+
+    return {
+        "request_id": request_id,
+        "output_path": output_path,
+        "detections": len(detections),
+        "inference_time_ms": inference_time * 1000
+    }
+
+
+def run_concurrent_inference(image_path: str, num_requests: int = 50, max_workers: int = 10):
+    """Run n concurrent requests to Triton server."""
+    print(f"Starting {num_requests} concurrent requests to {TRITON_URL}")
+    print(f"Model: {MODEL_NAME}, Image: {image_path}")
+    print(f"Max workers: {max_workers} (limited to avoid connection overload)")
+    print("-" * 50)
+
+    # Create ONE client and reuse it (thread-safe for grpc client)
+    triton_client = grpcclient.InferenceServerClient(url=TRITON_URL)
+    print("Triton client connected successfully")
+
+    results = []
+    errors = []
+    start_time = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(infer_image_concurrent, image_path, i, "outputs", triton_client): i
+            for i in range(num_requests)
+        }
+
+        for future in as_completed(futures):
+            req_id = futures[future]
+            try:
+                result = future.result()
+                results.append(result)
+                print(f"Request #{req_id:04d} completed in {result['inference_time_ms']:.2f}ms")
+            except Exception as e:
+                errors.append((req_id, str(e)))
+                print(f"Request #{req_id:04d} FAILED: {e}")
+
+    total_time = time.perf_counter() - start_time
+
+    print("-" * 50)
+    print(f"Completed: {len(results)}/{num_requests} successful, {len(errors)} failed")
+    print(f"Total time: {total_time:.2f}s")
+    print(f"Throughput: {len(results)/total_time:.2f} req/s")
+    print(f"Avg latency: {sum(r['inference_time_ms'] for r in results)/len(results):.2f}ms" if results else "N/A")
+
+    if errors:
+        print(f"\nErrors: {len(errors)}")
+        for req_id, err in errors[:5]:
+            print(f"  Request #{req_id}: {err}")
+
+    return results, errors
 
 def infer_video_stream(video_path: int = 0):
     """Run inference on video stream."""
@@ -257,11 +359,18 @@ if __name__ == "__main__":
     parser.add_argument("--stream", action="store_true", help="Use video stream (default: webcam)")
     parser.add_argument("--device", type=int, default=0, help="Video device index (default: 0)")
     parser.add_argument("--url", type=str, default="localhost:8001", help="Triton server URL")
+    parser.add_argument("--concurrent", type=int, default=0, help="Run N concurrent requests (default: 0 = single inference)")
+    parser.add_argument("--workers", type=int, default=50, help="Max concurrent workers (default: 50)")
+    parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory for concurrent results")
 
     args = parser.parse_args()
     TRITON_URL = args.url
 
-    if args.image:
+    if args.concurrent > 0:
+        if not args.image:
+            parser.error("--concurrent requires --image")
+        run_concurrent_inference(args.image, num_requests=args.concurrent, max_workers=args.workers)
+    elif args.image:
         result = infer_image_triton(args.image, visualize=True)
         print(f"\nResults:")
         print(f"  Detections: {len(result['detections'])}")
@@ -277,3 +386,4 @@ if __name__ == "__main__":
         print("\nExample usage:")
         print("  python triton_yolo_client.py --image photo.jpg")
         print("  python triton_yolo_client.py --stream --device 0")
+        print("  python triton_yolo_client.py --image photo.jpg --concurrent 50")

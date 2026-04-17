@@ -7,15 +7,16 @@ This script:
 4. Starts Triton server (or generates docker run command)
 """
 
+import shutil
 import subprocess
 import os
 import sys
 from pathlib import Path
 
 # Configuration
-MODEL_NAME = "yolo11x"
+MODEL_NAME = "yolo11s"
 MODEL_VERSION = "1"
-WORKSPACE = Path("d:/TritonTest")
+WORKSPACE = Path(__file__).parent.resolve()
 MODEL_REPO = WORKSPACE / "model_repository"
 TRITON_MODEL_REPO = MODEL_REPO / MODEL_NAME / MODEL_VERSION
 
@@ -28,8 +29,10 @@ def run_command(cmd, description):
     print(f"\n{'='*60}")
     print(f"{description}")
     print(f"{'='*60}")
-    print(f"Command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Convert list to string for better Windows shell handling
+    cmd_str = " ".join([f'"{c}"' if " " in str(c) else str(c) for c in cmd])
+    print(f"Command: {cmd_str}")
+    result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, cwd=WORKSPACE)
     if result.stdout:
         print(result.stdout)
     if result.stderr:
@@ -53,30 +56,28 @@ def install_dependencies():
 
 def export_to_onnx():
     """Export YOLO11x to ONNX format."""
-    print("\n[2/5] Exporting YOLO11x to ONNX...")
+    print("\n[2/5] Exporting YOLO11s to ONNX...")
 
-    onnx_path = MODEL_REPO / f"{MODEL_NAME}.onnx"
+    from ultralytics import YOLO
+
+    onnx_dest = MODEL_REPO / f"{MODEL_NAME}.onnx"
     MODEL_REPO.mkdir(parents=True, exist_ok=True)
 
-    # Export using ultralytics
-    export_script = f"""
-from ultralytics import YOLO
-model = YOLO('yolo11x.pt')
-model.export(format='onnx', opset=12, simplify=True)
-"""
-    # For simplicity, we'll use trtexec to convert directly from PyTorch
-    # First download/load the model
-    cmd = [
-        sys.executable, "-c",
-        f"""
-from ultralytics import YOLO
-model = YOLO('yolo11x.pt')
-model.export(format='onnx', opset=12, simplify=True)
-print('ONNX export complete')
-"""
-    ]
-    run_command(cmd, "Exporting YOLO11x to ONNX")
-    return onnx_path
+    print(f"Loading {MODEL_NAME}.pt...")
+    model = YOLO(f"{MODEL_NAME}.pt")
+    print("Exporting to ONNX...")
+    export_path = model.export(format="onnx", opset=12, simplify=True)
+    print(f"Ultralytics exported to: {export_path}")
+
+    if export_path and os.path.exists(export_path):
+        if os.path.exists(onnx_dest):
+            os.remove(onnx_dest)
+        shutil.move(export_path, onnx_dest)
+        print(f"SUCCESS: Moved to {onnx_dest}")
+        return onnx_dest
+    else:
+        print("ERROR: Could not find exported ONNX file.")
+        return None
 
 def build_tensorrt_engine(onnx_path):
     """Build TensorRT engine from ONNX using trtexec."""
@@ -109,41 +110,42 @@ def create_triton_config():
 
     config = f"""
 name: "{MODEL_NAME}"
-platform: "tensorrt_plan"
+platform: "onnxruntime_onnx"
 max_batch_size: 8
+
 input [
   {{
     name: "images"
     data_type: TYPE_FP32
     dims: [3, 640, 640]
-    reshape {{ shape: [1, 3, 640, 640] }}
   }}
 ]
+
 output [
   {{
     name: "output0"
     data_type: TYPE_FP32
-    dims: [1, 84, 8400]
+    dims: [84, 8400]
   }}
 ]
+
 instance_group [
   {{
     kind: KIND_GPU
-    count: 1
+    count: 2
   }}
 ]
+
+dynamic_batching {{
+  preferred_batch_size: [4, 8, 16]
+  max_queue_delay_microseconds: 100
+}}
+
 optimization {{
   execution_accelerators {{
     gpu_execution_accelerator {{
       name: "tensorrt"
-      parameters {{
-        key: "precision_mode"
-        value: "FP16"
-      }}
-      parameters {{
-        key: "max_workspace_size_bytes"
-        value: "10737418240"
-      }}
+      parameters {{ key: "precision_mode" value: "FP16" }}
     }}
   }}
 }}
@@ -156,17 +158,15 @@ optimization {{
     print(f"Config saved to: {config_path}")
     return config_path
 
-def copy_engine_to_model_repo(engine_path):
-    """Copy TensorRT engine to Triton model repository."""
-    print("\n[5/5] Copying engine to model repository...")
-    dest = TRITON_MODEL_REPO / "model.plan"
-    import shutil
-    if engine_path.exists():
-        shutil.copy(engine_path, dest)
-        print(f"Engine copied to: {dest}")
+def copy_engine_to_model_repo(onnx_path):
+    """Copy ONNX model to Triton model repository."""
+    print("\n[5/5] Copying model to model repository...")
+    dest = TRITON_MODEL_REPO / "model.onnx"
+    if onnx_path.exists():
+        shutil.copy(onnx_path, dest)
+        print(f"Model copied to: {dest}")
     else:
-        print(f"WARNING: Engine not found at {engine_path}")
-        print("You may need to build the engine manually or fix the ONNX export path")
+        print(f"WARNING: ONNX model not found at {onnx_path}")
 
 def generate_docker_command():
     """Generate the Docker command to run Triton server."""
@@ -197,14 +197,14 @@ if __name__ == "__main__":
     # Step 2: Export to ONNX
     onnx_path = export_to_onnx()
 
-    # Step 3: Build TensorRT engine
-    engine_path = build_tensorrt_engine(onnx_path)
+    # Step 3: Build TensorRT engine (skipped - using ONNX with onnxruntime)
+    # engine_path = build_tensorrt_engine(onnx_path)
 
     # Step 4: Create Triton config
     create_triton_config()
 
-    # Step 5: Copy engine to model repo
-    copy_engine_to_model_repo(engine_path)
+    # Step 5: Copy ONNX model to model repo
+    copy_engine_to_model_repo(onnx_path)
 
     # Generate Docker command
     generate_docker_command()
